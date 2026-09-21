@@ -45,20 +45,29 @@ func loadConfig(path string) (*config, error) {
 		if err := json.Unmarshal(body, &c); err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
-	case errors.Is(err, os.ErrNotExist) && os.Getenv("CLINE_KEYS") != "":
-		// Container mode: keys come from the environment, everything else is
-		// defaults.
+	case errors.Is(err, os.ErrNotExist) && os.Getenv("CLINE_KEYS") == "":
+		// Nothing to fall back on, and "open config.json: no such file" is the
+		// message that actually helps.
+		return nil, err
+	case errors.Is(err, os.ErrNotExist):
+		// Container mode: keys arrive by environment, everything else defaults.
 	default:
 		return nil, err
 	}
 
+	c.overlayEnv()
+	return &c, c.withDefaults()
+}
+
+// overlayEnv lets the environment win over the file, so a container can run
+// with no file at all and the keys can stay out of the image.
+func (c *config) overlayEnv() {
 	if v := os.Getenv("CLINE_KEYS"); v != "" {
 		c.Keys = strings.Split(v, ",")
 	}
 	if v := os.Getenv("CLIENT_TOKEN"); v != "" {
 		c.ClientToken = v
 	}
-	return &c, c.withDefaults()
 }
 
 func (c *config) withDefaults() error {
@@ -74,9 +83,8 @@ func (c *config) withDefaults() error {
 	if c.CooldownMax <= 0 {
 		c.CooldownMax = duration(defaultCooldownMax)
 	}
-	if c.CooldownMax < c.Cooldown {
-		c.CooldownMax = c.Cooldown
-	}
+	// A ceiling below the starting point would make the doubling meaningless.
+	c.CooldownMax = max(c.CooldownMax, c.Cooldown)
 	if c.MaxAttempts <= 0 {
 		c.MaxAttempts = defaultMaxAttempts
 	}

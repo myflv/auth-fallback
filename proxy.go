@@ -43,12 +43,22 @@ type proxy struct {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.URL.Path == "/healthz":
+	if r.URL.Path == "/healthz" {
+		// Deliberately open: a load balancer has no token to offer.
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	case r.URL.Path == "/status":
+		return
+	}
+	// Every other endpoint sits behind the token, so a new one cannot
+	// accidentally ship open.
+	if !p.authorized(r) {
+		writeError(w, http.StatusUnauthorized, "wrong or missing proxy token")
+		return
+	}
+
+	switch r.URL.Path {
+	case "/status":
 		writeJSON(w, http.StatusOK, p.pool.snapshot(time.Now()))
-	case r.URL.Path == "/v1/chat/completions":
+	case "/v1/chat/completions":
 		p.chat(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "only /v1/chat/completions is served")
@@ -60,10 +70,6 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "only POST is supported")
 		return
 	}
-	if !p.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "wrong or missing proxy token")
-		return
-	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
@@ -73,17 +79,17 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	model := peekModel(body)
 
 	order := p.pool.order(model, time.Now())
-	if len(order) == 0 {
+	tries := min(len(order), p.maxAttempts)
+	if tries < 1 {
 		writeError(w, http.StatusServiceUnavailable, "no API keys configured")
 		return
 	}
-	tries := min(len(order), p.maxAttempts)
 
 	// Retries are deliberately narrow: only a 429 moves on to the next key. It
 	// arrives immediately, so a retry never multiplies the caller's latency,
 	// and it is the one answer that says something about the key rather than
 	// about the request.
-	for _, index := range order[:tries] {
+	for n, index := range order[:tries] {
 		if r.Context().Err() != nil {
 			return // caller hung up; nothing left to answer
 		}
@@ -101,26 +107,33 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests {
+		if resp.StatusCode != http.StatusTooManyRequests {
+			// A bad request, a rejected key, an upstream outage: the next key
+			// would answer the same way, so this goes straight back rather than
+			// costing the caller more round trips.
+			p.relay(w, resp)
+			return
+		}
+
+		until := p.pool.rateLimited(index, model, time.Now())
+		log.Printf("model=%s key=%d 429, parked for %s",
+			model, index, time.Until(until).Round(time.Second))
+
+		if n < tries-1 {
 			drain(resp)
-			until := p.pool.rateLimited(index, model, time.Now())
-			log.Printf("model=%s key=%d 429, parked for %s",
-				model, index, time.Until(until).Round(time.Second))
 			continue
 		}
 
-		// Anything else would look the same on the next key -- a bad request,
-		// a rejected key, an upstream outage -- so it goes straight back
-		// rather than costing the caller seven more round trips.
+		// That was the last key we were willing to try. Upstream's own 429 goes
+		// back, with our Retry-After on it. Synthesizing "every key is rate
+		// limited" here would be a lie whenever max_attempts cut the loop short
+		// and other keys were sitting free.
+		if secs := p.pool.retryAfter(model, time.Now()); secs > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+		}
 		p.relay(w, resp)
 		return
 	}
-
-	// Every key we were willing to try is rate limited.
-	if secs := p.pool.retryAfter(model, time.Now()); secs > 0 {
-		w.Header().Set("Retry-After", strconv.Itoa(secs))
-	}
-	writeError(w, http.StatusTooManyRequests, "every key is rate limited for "+model)
 }
 
 // authorized checks the caller's token. An empty client token means the proxy
@@ -148,6 +161,8 @@ func (p *proxy) send(r *http.Request, body []byte, index int) (*http.Response, e
 	if err != nil {
 		return nil, err
 	}
+	// NewRequestWithContext sizes Headers and ContentLength from the
+	// *bytes.Reader already, so the body survives the retry intact.
 	req.Header = r.Header.Clone()
 	for _, h := range hopHeaders {
 		req.Header.Del(h)
@@ -161,13 +176,12 @@ func (p *proxy) send(r *http.Request, body []byte, index int) (*http.Response, e
 	if req.Header.Get("x-client-type") == "" {
 		req.Header.Set("x-client-type", clientType)
 	}
-	req.ContentLength = int64(len(body))
 
 	return p.client.Do(req)
 }
 
-// relay streams a successful upstream reply back, flushing as it goes so SSE
-// frames reach the caller the moment they arrive.
+// relay streams an upstream reply back, flushing as it goes so SSE frames
+// reach the caller the moment they arrive.
 func (p *proxy) relay(w http.ResponseWriter, resp *http.Response) {
 	defer resp.Body.Close()
 
@@ -177,11 +191,14 @@ func (p *proxy) relay(w http.ResponseWriter, resp *http.Response) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(resp.StatusCode)
 
+	// http.ResponseWriter always implements Flusher in practice, but a flush
+	// per write is only free on the streaming path, so keep the plain copy as
+	// the fallback.
+	var dst io.Writer = w
 	if f, ok := w.(http.Flusher); ok {
-		_, _ = io.Copy(&flushWriter{w: w, f: f}, resp.Body)
-		return
+		dst = &flushWriter{w: w, f: f}
 	}
-	_, _ = io.Copy(w, resp.Body)
+	_, _ = io.Copy(dst, resp.Body)
 }
 
 // drain reads and closes a response we are not going to use, so its connection

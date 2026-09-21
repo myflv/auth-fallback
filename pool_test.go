@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -85,6 +86,9 @@ func TestCooldownDoublesThenCaps(t *testing.T) {
 		5 * time.Minute, // capped
 		5 * time.Minute,
 	} {
+		// Each 429 has to land after the previous cooldown ran out, otherwise
+		// it is just a probe of a key that never came back.
+		now = now.Add(want)
 		if got := p.rateLimited(0, "m", now).Sub(now); got != want {
 			t.Errorf("429 #%d parked for %s, want %s", i+1, got, want)
 		}
@@ -98,13 +102,31 @@ func TestCooldownDoublesThenCaps(t *testing.T) {
 	}
 }
 
+// Only a key that came back and failed again is backing off. One still inside
+// its cooldown is being probed optimistically, and that probe failing says
+// nothing new about the quota.
+func TestProbingAParkedKeyDoesNotEscalate(t *testing.T) {
+	p := newPool([]string{"a"}, time.Minute, time.Hour)
+	now := time.Now()
+
+	first := p.rateLimited(0, "m", now)
+	probe := now.Add(10 * time.Second)
+	second := p.rateLimited(0, "m", probe)
+
+	if got := second.Sub(probe); got != time.Minute {
+		t.Errorf("the probe parked the key for %s, want the cooldown still %s", got, time.Minute)
+	}
+	if !second.After(first) {
+		t.Errorf("second = %s, want it pushed past the first (%s)", second, first)
+	}
+}
+
 func TestParkedKeysAreOfferedEarliestFirst(t *testing.T) {
 	p := newPool([]string{"a", "b", "c"}, time.Minute, time.Hour)
 	now := time.Now()
 
-	p.rateLimited(2, "m", now) // c: 1m
-	p.rateLimited(1, "m", now)
-	p.rateLimited(1, "m", now) // b: 2m, and now the model is back on key 0
+	p.rateLimited(2, "m", now)                     // c: back at +1m
+	p.rateLimited(1, "m", now.Add(30*time.Second)) // b: back at +1m30s
 
 	got := p.order("m", now)
 	if len(got) != 3 {
@@ -161,6 +183,44 @@ func TestRetryAfter(t *testing.T) {
 	}
 	if got := p.retryAfter(deepseek, now); got != 0 {
 		t.Errorf("another model = %d, want 0", got)
+	}
+}
+
+// Model names come out of the request body, so the cooldown table needs a way
+// to forget the ones nobody is using any more.
+func TestExpiredCooldownsArePruned(t *testing.T) {
+	p := newPool([]string{"a"}, time.Minute, time.Hour)
+	now := time.Now()
+
+	for i := range pruneAt + 5 {
+		p.rateLimited(0, fmt.Sprintf("model-%d", i), now)
+	}
+	if len(p.cooling) <= pruneAt {
+		t.Fatalf("table holds %d entries, expected the sweep threshold to be crossed", len(p.cooling))
+	}
+
+	// Long enough that every entry is past the point where it says anything.
+	later := now.Add(3 * time.Hour)
+	p.rateLimited(0, "fresh", later)
+
+	if _, ok := p.cooling[coolKey{0, "model-0"}]; ok {
+		t.Error("a long-expired cooldown survived the sweep")
+	}
+	if _, ok := p.cooling[coolKey{0, "fresh"}]; !ok {
+		t.Error("the sweep dropped the cooldown it had just been handed")
+	}
+}
+
+// Forgetting a cursor would silently move a healthy model back to key 0, which
+// is exactly the switch the design avoids.
+func TestPruningKeepsCursors(t *testing.T) {
+	p := newPool([]string{"a", "b"}, time.Minute, time.Hour)
+	now := time.Now()
+	p.rateLimited(0, "m", now)
+
+	p.pruneLocked(now.Add(24 * time.Hour))
+	if got := preferred(p, "m"); got != 1 {
+		t.Errorf("the model is on key %d after a sweep, want it still on key 1", got)
 	}
 }
 

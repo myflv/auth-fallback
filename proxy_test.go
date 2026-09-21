@@ -18,31 +18,22 @@ const (
 	claude   = "anthropic/claude-sonnet-4-6"
 )
 
-type call struct{ key, model string }
-
+// rec records the key each upstream request arrived with, in order.
 type rec struct {
 	mu   sync.Mutex
-	seen []call
+	seen []string
 }
 
-func (r *rec) add(key, model string) {
+func (r *rec) add(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.seen = append(r.seen, call{key, model})
-}
-
-func (r *rec) calls() []call {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]call(nil), r.seen...)
+	r.seen = append(r.seen, key)
 }
 
 func (r *rec) keys() []string {
-	var out []string
-	for _, c := range r.calls() {
-		out = append(out, c.key)
-	}
-	return out
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.seen...)
 }
 
 func upstream(t *testing.T, r *rec, h func(w http.ResponseWriter, key, model string)) *httptest.Server {
@@ -50,12 +41,8 @@ func upstream(t *testing.T, r *rec, h func(w http.ResponseWriter, key, model str
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		key := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
 		body, _ := io.ReadAll(req.Body)
-		var probe struct {
-			Model string `json:"model"`
-		}
-		_ = json.Unmarshal(body, &probe)
-		r.add(key, probe.Model)
-		h(w, key, probe.Model)
+		r.add(key)
+		h(w, key, peekModel(body))
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -66,21 +53,29 @@ func ok(w http.ResponseWriter) {
 	_, _ = io.WriteString(w, `{"data":{"id":"gen_1","object":"chat.completion"},"success":true}`)
 }
 
+const limitedBody = `{"error":"rate limited","success":false}`
+
 func limited(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusTooManyRequests)
-	_, _ = io.WriteString(w, `{"error":"rate limited","success":false}`)
+	_, _ = io.WriteString(w, limitedBody)
+}
+
+func status(w http.ResponseWriter, code int, body string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = io.WriteString(w, body)
 }
 
 func newProxy(t *testing.T, up *httptest.Server, keys ...string) *httptest.Server {
 	t.Helper()
-	srv, _ := newProxyWith(t, up, 3, keys...)
+	srv, _ := newProxyAt(t, up.URL+"/api/v1", 3, keys...)
 	return srv
 }
 
-func newProxyWith(t *testing.T, up *httptest.Server, maxAttempts int, keys ...string) (*httptest.Server, *proxy) {
+func newProxyAt(t *testing.T, baseURL string, maxAttempts int, keys ...string) (*httptest.Server, *proxy) {
 	t.Helper()
-	base, err := url.Parse(up.URL + "/api/v1")
+	base, err := url.Parse(baseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,11 +101,27 @@ func chatBody(model string, stream bool) string {
 
 func post(t *testing.T, url, token, body string) (*http.Response, []byte) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	return send(t, http.MethodPost, url, token, body)
+}
+
+func get(t *testing.T, url, token string) (*http.Response, []byte) {
+	t.Helper()
+	return send(t, http.MethodGet, url, token, "")
+}
+
+func send(t *testing.T, method, url, token, body string) (*http.Response, []byte) {
+	t.Helper()
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -187,12 +198,12 @@ func TestExhaustingOneModelLeavesTheOthersAlone(t *testing.T) {
 		t.Fatalf("status = %d, want 429 once the whole pool is spent", resp.StatusCode)
 	}
 
-	before := len(r.calls())
+	before := len(r.keys())
 	resp, out := post(t, p.URL+"/v1/chat/completions", "", chatBody(claude, false))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("the other model got %d: %s", resp.StatusCode, out)
 	}
-	if got := len(r.calls()) - before; got != 1 {
+	if got := len(r.keys()) - before; got != 1 {
 		t.Errorf("the other model took %d attempts, want 1: deepseek's cooldown leaked", got)
 	}
 }
@@ -223,14 +234,19 @@ func TestMaxAttemptsOneTurnsRetryingOff(t *testing.T) {
 		}
 		ok(w)
 	})
-	p, _ := newProxyWith(t, up, 1, "k0", "k1")
+	p, _ := newProxyAt(t, up.URL+"/api/v1", 1, "k0", "k1")
 
-	resp, _ := post(t, p.URL+"/v1/chat/completions", "", chatBody(deepseek, false))
+	resp, out := post(t, p.URL+"/v1/chat/completions", "", chatBody(deepseek, false))
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want the upstream 429 straight through", resp.StatusCode)
 	}
 	if got := r.keys(); !slices.Equal(got, []string{"k0"}) {
 		t.Errorf("upstream saw %v, want exactly one attempt", got)
+	}
+	// Upstream's own explanation, not a synthesized one. Telling the caller
+	// "every key is rate limited" would be false with k1 sitting free.
+	if string(out) != limitedBody {
+		t.Errorf("body = %s, want upstream's own %s", out, limitedBody)
 	}
 }
 
@@ -258,56 +274,41 @@ func TestTheCallersTokenIsReplacedByAPoolKey(t *testing.T) {
 	}
 }
 
-// A bad request would be bad on all eight keys, so there is nothing to gain
-// from trying them.
-func TestClientErrorsAreNotRetried(t *testing.T) {
-	r := &rec{}
-	up := upstream(t, r, func(w http.ResponseWriter, _, _ string) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":"unknown model","success":false}`)
-	})
-	p := newProxy(t, up, "k0", "k1", "k2")
+// Every key points at the same host and carries the same request, so only a 429
+// says anything the next key could answer differently.
+func TestOnly429IsRetried(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"bad request", http.StatusBadRequest, `{"error":"unknown model","success":false}`},
+		{"rejected key", http.StatusUnauthorized, `{"error":"bad key","success":false}`},
+		{"upstream outage", http.StatusInternalServerError, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &rec{}
+			up := upstream(t, r, func(w http.ResponseWriter, _, _ string) {
+				status(w, tc.status, tc.body)
+			})
+			p := newProxy(t, up, "k0", "k1", "k2")
 
-	resp, out := post(t, p.URL+"/v1/chat/completions", "", chatBody("nope", false))
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	if !strings.Contains(string(out), "unknown model") {
-		t.Errorf("upstream's explanation was lost: %s", out)
-	}
-	if got := len(r.calls()); got != 1 {
-		t.Errorf("made %d attempts, want 1", got)
-	}
-}
-
-// Every key points at the same host, so an upstream outage is not something a
-// different key fixes; retrying would only triple the caller's wait.
-func TestUpstreamErrorsAreNotRetried(t *testing.T) {
-	r := &rec{}
-	up := upstream(t, r, func(w http.ResponseWriter, _, _ string) {
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	p := newProxy(t, up, "k0", "k1", "k2")
-
-	resp, _ := post(t, p.URL+"/v1/chat/completions", "", chatBody(deepseek, false))
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", resp.StatusCode)
-	}
-	if got := len(r.calls()); got != 1 {
-		t.Errorf("made %d attempts, want 1", got)
+			resp, out := post(t, p.URL+"/v1/chat/completions", "", chatBody(deepseek, false))
+			if resp.StatusCode != tc.status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.status)
+			}
+			if tc.body != "" && string(out) != tc.body {
+				t.Errorf("body = %s, want upstream's own %s", out, tc.body)
+			}
+			if got := len(r.keys()); got != 1 {
+				t.Errorf("made %d attempts, want 1", got)
+			}
+		})
 	}
 }
 
 func TestUnreachableUpstream(t *testing.T) {
-	base, _ := url.Parse("http://127.0.0.1:1/api/v1")
-	p := httptest.NewServer(&proxy{
-		base:        base,
-		client:      newHTTPClient(),
-		pool:        newPool([]string{"k0"}, time.Minute, time.Hour),
-		maxAttempts: 3,
-	})
-	defer p.Close()
+	p, _ := newProxyAt(t, "http://127.0.0.1:1/api/v1", 3, "k0")
 
 	resp, out := post(t, p.URL+"/v1/chat/completions", "", chatBody(deepseek, false))
 	if resp.StatusCode != http.StatusBadGateway {
@@ -326,17 +327,27 @@ func TestUnreachableUpstream(t *testing.T) {
 func TestProxyTokenIsEnforced(t *testing.T) {
 	r := &rec{}
 	up := upstream(t, r, func(w http.ResponseWriter, _, _ string) { ok(w) })
-	p, pr := newProxyWith(t, up, 3, "k0")
+	p, pr := newProxyAt(t, up.URL+"/api/v1", 3, "k0")
 	pr.clientToken = "s3cret"
 
-	if resp, _ := post(t, p.URL+"/v1/chat/completions", "wrong", chatBody(deepseek, false)); resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("wrong token got %d, want 401", resp.StatusCode)
+	for _, tc := range []struct{ name, token string }{
+		{"wrong token", "wrong"},
+		{"no token", ""},
+	} {
+		if resp, _ := post(t, p.URL+"/v1/chat/completions", tc.token, chatBody(deepseek, false)); resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: got %d, want 401", tc.name, resp.StatusCode)
+		}
 	}
-	if resp, _ := post(t, p.URL+"/v1/chat/completions", "", chatBody(deepseek, false)); resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("no token got %d, want 401", resp.StatusCode)
+	// /status describes the pool, so it sits behind the token as well.
+	if resp, _ := get(t, p.URL+"/status", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("/status got %d without a token, want 401", resp.StatusCode)
 	}
-	if len(r.calls()) != 0 {
-		t.Errorf("upstream was called %d times before the token checked out", len(r.calls()))
+	// /healthz stays open: a load balancer has no token to offer.
+	if resp, _ := get(t, p.URL+"/healthz", ""); resp.StatusCode != http.StatusOK {
+		t.Errorf("/healthz got %d, want 200", resp.StatusCode)
+	}
+	if len(r.keys()) != 0 {
+		t.Errorf("upstream was called %d times before the token checked out", len(r.keys()))
 	}
 
 	if resp, _ := post(t, p.URL+"/v1/chat/completions", "s3cret", chatBody(deepseek, false)); resp.StatusCode != http.StatusOK {
@@ -349,19 +360,13 @@ func TestOnlyChatCompletionsIsServed(t *testing.T) {
 	up := upstream(t, r, func(w http.ResponseWriter, _, _ string) { ok(w) })
 	p := newProxy(t, up, "k0")
 
-	resp, err := http.Get(p.URL + "/v1/models")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
+	if resp, _ := get(t, p.URL+"/v1/models", ""); resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
 	}
-
 	if resp, _ := post(t, p.URL+"/v1/chat/completions", "", chatBody(deepseek, false)); resp.StatusCode != http.StatusOK {
 		t.Errorf("chat completions stopped working")
 	}
-	if path := r.calls(); len(path) != 1 {
-		t.Errorf("upstream saw %v", path)
+	if got := len(r.keys()); got != 1 {
+		t.Errorf("upstream saw %d requests, want only the chat one", got)
 	}
 }
