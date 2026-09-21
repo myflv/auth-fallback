@@ -1,0 +1,21 @@
+{
+  "listen": ":8787",
+  "upstream": "https://api.cline.bot/api/v1",
+
+  "client_token": "change-me",
+
+  "cooldown": "60s",
+  "cooldown_max": "30m",
+  "max_attempts": 3,
+
+  "keys": [
+    "sk-cline-1",
+    "sk-cline-2",
+    "sk-cline-3",
+    "sk-cline-4",
+    "sk-cline-5",
+    "sk-cline-6",
+    "sk-cline-7",
+    "sk-cline-8"
+  ]
+}

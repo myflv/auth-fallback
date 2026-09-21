@@ -1,0 +1,8 @@
+services:
+  auth-fallback:
+    build: .
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./config.json:/config.json:ro
+    restart: unless-stopped
