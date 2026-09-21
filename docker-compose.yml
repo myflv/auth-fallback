@@ -1,6 +1,6 @@
 services:
   auth-fallback:
-    build: .
+    image: ghcr.io/myflv/auth-fallback:latest
     ports:
       - "8787:8787"
     volumes:

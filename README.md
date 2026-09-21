@@ -57,6 +57,12 @@ cp config.example.json config.json && $EDITOR config.json
 go build -o auth-fallback . && ./auth-fallback
 ```
 
+或者用发布好的镜像（`docker-compose.yml` 直接拉 ghcr，不本地构建）：
+
+```bash
+docker compose up -d          # 想固定版本就改 image: 为 ghcr.io/myflv/auth-fallback:v0.1.0
+```
+
 调用者 `base_url` 指到 `http://<host>:8787/v1`。**Authorization 里填什么都可以** —— 代理会丢掉它，换成池子里的 key。
 
 ## 配置
