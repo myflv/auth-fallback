@@ -56,9 +56,7 @@ func ok(w http.ResponseWriter) {
 const limitedBody = `{"error":"rate limited","success":false}`
 
 func limited(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusTooManyRequests)
-	_, _ = io.WriteString(w, limitedBody)
+	status(w, http.StatusTooManyRequests, limitedBody)
 }
 
 func status(w http.ResponseWriter, code int, body string) {
@@ -338,9 +336,10 @@ func TestProxyTokenIsEnforced(t *testing.T) {
 			t.Errorf("%s: got %d, want 401", tc.name, resp.StatusCode)
 		}
 	}
-	// /status describes the pool, so it sits behind the token as well.
-	if resp, _ := get(t, p.URL+"/status", ""); resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("/status got %d without a token, want 401", resp.StatusCode)
+	// The check runs before routing, so an unknown path sits behind it as well:
+	// the proxy cannot be used to probe which paths exist without a token.
+	if resp, _ := get(t, p.URL+"/v1/models", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("an unrouted path without a token got %d, want 401", resp.StatusCode)
 	}
 	// /healthz stays open: a load balancer has no token to offer.
 	if resp, _ := get(t, p.URL+"/healthz", ""); resp.StatusCode != http.StatusOK {
@@ -368,5 +367,33 @@ func TestOnlyChatCompletionsIsServed(t *testing.T) {
 	}
 	if got := len(r.keys()); got != 1 {
 		t.Errorf("upstream saw %d requests, want only the chat one", got)
+	}
+}
+
+// The model name becomes a key in the pool's tables and is kept there, so an
+// implausible one is refused before it can be carried around.
+func TestImplausiblyLongModelNamesAreRefused(t *testing.T) {
+	r := &rec{}
+	up := upstream(t, r, func(w http.ResponseWriter, _, _ string) { ok(w) })
+	p := newProxy(t, up, "k0")
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		want  int
+	}{
+		{"a real id", deepseek, http.StatusOK},
+		{"at the limit", strings.Repeat("m", maxModelLen), http.StatusOK},
+		{"past the limit", strings.Repeat("m", maxModelLen+1), http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, _ := post(t, p.URL+"/v1/chat/completions", "", chatBody(tc.model, false))
+			if resp.StatusCode != tc.want {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
+	}
+	if got := len(r.keys()); got != 2 {
+		t.Errorf("upstream saw %d requests, want only the plausible two", got)
 	}
 }

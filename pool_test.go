@@ -1,9 +1,8 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 )
@@ -37,24 +36,16 @@ func TestCursorWrapsAround(t *testing.T) {
 	now := time.Now()
 
 	p.rateLimited(0, "m", now)
-	if got := preferred(p, "m"); got != 1 {
+	if got := p.order("m", now)[0]; got != 1 {
 		t.Errorf("model moved to key %d, want key 1", got)
 	}
+
+	// Both keys are parked for the same length now, so the order settles on the
+	// cursor -- which has wrapped back round to key 0.
 	p.rateLimited(1, "m", now)
-	if got := preferred(p, "m"); got != 0 {
+	if got := p.order("m", now)[0]; got != 0 {
 		t.Errorf("model moved to key %d, want it to wrap back to key 0", got)
 	}
-}
-
-// preferred reads the model's current key back out of the published state, so
-// the test asserts what /status shows rather than poking at internals.
-func preferred(p *pool, model string) int {
-	for _, st := range p.snapshot(time.Now()) {
-		if slices.Contains(st.PreferredFor, model) {
-			return st.Index
-		}
-	}
-	return -1
 }
 
 // The whole point of the pool: a key that ran out of deepseek quota must stay
@@ -95,8 +86,9 @@ func TestCooldownDoublesThenCaps(t *testing.T) {
 	}
 
 	// One success resets the escalation, so a key that recovers is not punished
-	// for its history.
-	p.succeeded(0, "m")
+	// for its history. It has to come after the park it is undoing.
+	now = now.Add(5 * time.Minute)
+	p.succeeded(0, "m", now)
 	if got := p.rateLimited(0, "m", now).Sub(now); got != time.Minute {
 		t.Errorf("after a success the cooldown was %s, want %s", got, time.Minute)
 	}
@@ -104,20 +96,33 @@ func TestCooldownDoublesThenCaps(t *testing.T) {
 
 // Only a key that came back and failed again is backing off. One still inside
 // its cooldown is being probed optimistically, and that probe failing says
-// nothing new about the quota.
+// nothing new -- and, the part that matters under steady traffic, it must not
+// push the key's recovery further out either.
 func TestProbingAParkedKeyDoesNotEscalate(t *testing.T) {
 	p := newPool([]string{"a"}, time.Minute, time.Hour)
 	now := time.Now()
 
-	first := p.rateLimited(0, "m", now)
-	probe := now.Add(10 * time.Second)
-	second := p.rateLimited(0, "m", probe)
+	until := p.rateLimited(0, "m", now)
 
-	if got := second.Sub(probe); got != time.Minute {
-		t.Errorf("the probe parked the key for %s, want the cooldown still %s", got, time.Minute)
+	again := p.rateLimited(0, "m", now.Add(10*time.Second))
+	if again != until {
+		t.Errorf("the probe moved the deadline from %s to %s, want it left alone",
+			until.Sub(now), again.Sub(now))
 	}
-	if !second.After(first) {
-		t.Errorf("second = %s, want it pushed past the first (%s)", second, first)
+	if got := p.cooling[coolKey{0, "m"}].strikes; got != 1 {
+		t.Errorf("strikes = %d after a probe, want 1", got)
+	}
+
+	// However many probes arrive while it is parked, the key still comes back
+	// when it was always due to.
+	for i := 1; i <= 5; i++ {
+		p.rateLimited(0, "m", now.Add(time.Duration(i)*10*time.Second))
+	}
+	if got := p.retryAfter("m", now.Add(time.Minute+time.Second)); got != 0 {
+		t.Errorf("retryAfter = %ds just past the deadline, want the key back", got)
+	}
+	if got := p.cooling[coolKey{0, "m"}].strikes; got != 1 {
+		t.Errorf("strikes = %d after five probes, want them all ignored", got)
 	}
 }
 
@@ -186,60 +191,203 @@ func TestRetryAfter(t *testing.T) {
 	}
 }
 
-// Model names come out of the request body, so the cooldown table needs a way
-// to forget the ones nobody is using any more.
-func TestExpiredCooldownsArePruned(t *testing.T) {
-	p := newPool([]string{"a"}, time.Minute, time.Hour)
+// The escalation is about consecutive failures. A key that has been out of
+// cooldown for longer than the longest cooldown is not still failing, whatever
+// else happens to be in the table.
+func TestEscalationDecaysOnTheClock(t *testing.T) {
+	p := newPool([]string{"a"}, time.Minute, 5*time.Minute)
 	now := time.Now()
+	p.rateLimited(0, "m", now)
 
-	for i := range pruneAt + 5 {
-		p.rateLimited(0, fmt.Sprintf("model-%d", i), now)
-	}
-	if len(p.cooling) <= pruneAt {
-		t.Fatalf("table holds %d entries, expected the sweep threshold to be crossed", len(p.cooling))
+	// Straight after recovery it is still the same run of failures.
+	soon := now.Add(time.Minute + time.Second)
+	if got := p.rateLimited(0, "m", soon).Sub(soon); got != 2*time.Minute {
+		t.Errorf("a 429 just after recovery parked for %s, want 2m", got)
 	}
 
-	// Long enough that every entry is past the point where it says anything.
-	later := now.Add(3 * time.Hour)
-	p.rateLimited(0, "fresh", later)
-
-	if _, ok := p.cooling[coolKey{0, "model-0"}]; ok {
-		t.Error("a long-expired cooldown survived the sweep")
-	}
-	if _, ok := p.cooling[coolKey{0, "fresh"}]; !ok {
-		t.Error("the sweep dropped the cooldown it had just been handed")
+	// After a long idle the slate is clean.
+	q := newPool([]string{"a"}, time.Minute, 5*time.Minute)
+	q.rateLimited(0, "m", now)
+	idle := now.Add(time.Minute + 5*time.Minute + time.Second)
+	if got := q.rateLimited(0, "m", idle).Sub(idle); got != time.Minute {
+		t.Errorf("a 429 after a long idle parked for %s, want the base 1m", got)
 	}
 }
 
-// Forgetting a cursor would silently move a healthy model back to key 0, which
-// is exactly the switch the design avoids.
-func TestPruningKeepsCursors(t *testing.T) {
+// A cooldown is only reclaimed once it is past saying anything: staleness is
+// the point at which decay has already discounted it and order already reads it
+// as usable, so dropping it changes no answer.
+func TestOnlyStaleCooldownsAreSwept(t *testing.T) {
+	// Two keys, so a cursor can sit somewhere other than key 0.
+	p := newPool([]string{"a", "b"}, time.Minute, time.Hour)
+	now := time.Now()
+
+	p.rateLimited(0, "spent", now)
+
+	// No cooldown has been over long enough to be dead yet.
+	p.sweep(now.Add(time.Minute))
+	if _, ok := p.cooling[coolKey{0, "spent"}]; !ok {
+		t.Error("the sweep dropped a cooldown that had not gone stale")
+	}
+
+	// Long past saying anything -- and a fresh one recorded at the same moment,
+	// which must survive.
+	later := now.Add(time.Hour + 2*time.Minute)
+	p.rateLimited(0, "fresh", later)
+	p.sweep(later)
+
+	if _, ok := p.cooling[coolKey{0, "spent"}]; ok {
+		t.Error("a long-stale cooldown survived the sweep")
+	}
+	if _, ok := p.cooling[coolKey{0, "fresh"}]; !ok {
+		t.Error("the sweep dropped a cooldown that had just been recorded")
+	}
+	// The sweep sheds cooldowns, never cursors: forgetting one would move a
+	// healthy model back to key 0, which is the switch the design avoids.
+	if got := p.cursor["spent"]; got != 1 {
+		t.Errorf("cursor for the swept model is %d, want it left at 1", got)
+	}
+}
+
+// Reclaiming is on a timer off the request path, so nothing happens at all
+// unless something runs the loop.
+func TestSweepLoopReclaimsDeadCooldowns(t *testing.T) {
+	p := newPool([]string{"a"}, time.Minute, time.Hour)
+	p.cooling[coolKey{0, "spent"}] = cooldown{until: time.Now().Add(-2 * time.Hour)}
+
+	gone := func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		_, ok := p.cooling[coolKey{0, "spent"}]
+		return !ok
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go p.sweepLoop(ctx, time.Millisecond)
+
+	for !gone() {
+		select {
+		case <-ctx.Done():
+			t.Fatal("the sweep loop never reclaimed the dead cooldown")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// A key that recovers must not take a model back from the key that is serving
+// it. That would be a switch with no 429 behind it, costing exactly the cache
+// stickiness exists to keep.
+func TestARecoveredKeyDoesNotStealTheModelBack(t *testing.T) {
+	p := newPool([]string{"a", "b", "c"}, time.Minute, time.Hour)
+	now := time.Now()
+
+	p.rateLimited(0, "m", now) // cursor -> 1
+	p.rateLimited(2, "m", now) // cursor wraps back round onto parked key 0
+	p.succeeded(1, "m", now)   // but key 1 is the one doing the work
+
+	// By now every cooldown has run out. The model still belongs to key 1.
+	later := now.Add(2 * time.Minute)
+	if got := p.order("m", later)[0]; got != 1 {
+		t.Errorf("model moved to key %d, want it left on key 1", got)
+	}
+}
+
+// Both edges of the window are exact. A cooldown that has just run out is the
+// same run continuing, and one idle for exactly the longest cooldown still is;
+// a nanosecond more and it starts over.
+func TestDecayBoundaries(t *testing.T) {
+	now := time.Now()
+	fresh := func() *pool {
+		p := newPool([]string{"a"}, time.Minute, 5*time.Minute)
+		p.rateLimited(0, "m", now)
+		return p
+	}
+
+	at := now.Add(time.Minute) // exactly when the key is due back
+	if p := fresh(); p.rateLimited(0, "m", at).Sub(at) != 2*time.Minute {
+		t.Errorf("at the deadline the cooldown was %s, want 2m", p.rateLimited(0, "m", at).Sub(at))
+	}
+
+	edge := now.Add(time.Minute + 5*time.Minute) // exactly the end of the window
+	if p := fresh(); p.rateLimited(0, "m", edge).Sub(edge) != 2*time.Minute {
+		t.Errorf("at the edge of the window the cooldown was %s, want 2m", p.rateLimited(0, "m", edge).Sub(edge))
+	}
+
+	past := edge.Add(time.Nanosecond)
+	if p := fresh(); p.rateLimited(0, "m", past).Sub(past) != time.Minute {
+		t.Errorf("past the window the cooldown was %s, want the base 1m", p.rateLimited(0, "m", past).Sub(past))
+	}
+}
+
+// A success from a request that was already in flight when the key got parked
+// must not undo that. The 429 is the newer news, and letting the older request
+// win would walk the model back to a key the proxy has just been told is
+// limited -- a switch with nothing behind it.
+func TestASuccessCannotUndoANewerPark(t *testing.T) {
+	p := newPool([]string{"a", "b"}, time.Minute, time.Hour)
+	sent := time.Now()
+
+	// This request goes out at sent, and comes back 200 only much later.
+	// Meanwhile a faster one has already taken a 429 from the same key.
+	p.rateLimited(0, "m", sent.Add(time.Second))
+	p.succeeded(0, "m", sent)
+
+	if _, ok := p.cooling[coolKey{0, "m"}]; !ok {
+		t.Error("a stale success cleared a park that was newer than it")
+	}
+	if got := p.order("m", sent.Add(2*time.Second))[0]; got != 1 {
+		t.Errorf("the model went back to key %d, want it left on key 1", got)
+	}
+}
+
+// The opposite case: the key was already parked when the request went out, and
+// it came back 200 -- a probe finding the key had recovered early. That one
+// does count, or the key would sit out a cooldown it has just disproved.
+func TestAProbeThatSucceedsClearsThePark(t *testing.T) {
 	p := newPool([]string{"a", "b"}, time.Minute, time.Hour)
 	now := time.Now()
 	p.rateLimited(0, "m", now)
 
-	p.pruneLocked(now.Add(24 * time.Hour))
-	if got := preferred(p, "m"); got != 1 {
-		t.Errorf("the model is on key %d after a sweep, want it still on key 1", got)
+	p.succeeded(0, "m", now.Add(time.Second)) // sent while key 0 was parked
+
+	if _, ok := p.cooling[coolKey{0, "m"}]; ok {
+		t.Error("a probe that came back 200 left the park in place")
+	}
+	if got := p.order("m", now.Add(2*time.Second))[0]; got != 0 {
+		t.Errorf("the model is on key %d, want the key that just served it", got)
 	}
 }
 
-func TestSnapshotMasksKeys(t *testing.T) {
-	p := newPool([]string{"sk-cline-abcdefghijklmnop"}, time.Minute, time.Hour)
-	now := time.Now()
-	p.rateLimited(0, deepseek, now)
+// Which of the two replies arrives first must not change where the model ends
+// up. Whichever order they land in, the 429 is what decides.
+func TestARaceSettlesTheSameEitherWay(t *testing.T) {
+	settle := func(successFirst bool) (int, bool) {
+		p := newPool([]string{"a", "b"}, time.Minute, time.Hour)
+		sent := time.Now() // both requests went out here
+		early := sent.Add(time.Second)
+		late := sent.Add(2 * time.Second)
 
-	snap := p.snapshot(now)
-	if len(snap) != 1 {
-		t.Fatalf("snapshot = %v", snap)
+		if successFirst {
+			p.succeeded(0, "m", sent)
+			p.rateLimited(0, "m", early)
+		} else {
+			p.rateLimited(0, "m", early)
+			p.succeeded(0, "m", sent)
+		}
+		_, parked := p.cooling[coolKey{0, "m"}]
+		return p.order("m", late)[0], parked
 	}
-	if strings.Contains(snap[0].Key, "abcdefghij") {
-		t.Errorf("the key leaked into /status: %q", snap[0].Key)
+
+	firstKey, firstParked := settle(true)
+	secondKey, secondParked := settle(false)
+
+	if firstKey != secondKey || firstParked != secondParked {
+		t.Errorf("the race settled by arrival order: success-first -> key %d parked=%v, 429-first -> key %d parked=%v",
+			firstKey, firstParked, secondKey, secondParked)
 	}
-	if snap[0].Cooling[deepseek] == "" {
-		t.Errorf("snapshot does not say what is parked: %+v", snap[0])
-	}
-	if !slices.Contains(snap[0].PreferredFor, deepseek) {
-		t.Errorf("snapshot does not say which key the model is on: %+v", snap[0])
+	if firstKey != 1 || !firstParked {
+		t.Errorf("settled on key %d with key 0 parked=%v, want key 1 with key 0 still parked",
+			firstKey, firstParked)
 	}
 }

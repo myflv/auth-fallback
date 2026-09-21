@@ -57,6 +57,14 @@ func main() {
 		// No WriteTimeout: an answer can take minutes.
 	}
 
+	// Model names come out of the request body, so the cooldown table needs
+	// reclaiming. Nothing depends on the exact interval: an entry only becomes
+	// reclaimable max after its cooldown has ended, so anything well under that
+	// is early enough.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go p.pool.sweepLoop(ctx, time.Minute)
+
 	log.Printf("%d keys -> %s, listening on %s (429 cooldown %s, doubling to %s, %d attempt(s) max)",
 		len(cfg.Keys), cfg.Upstream, cfg.Listen, cfg.Cooldown, cfg.CooldownMax, cfg.MaxAttempts)
 
@@ -67,16 +75,14 @@ func main() {
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	select {
 	case err := <-errc:
 		log.Fatalf("server error: %v", err)
-	case sig := <-stop:
-		log.Printf("received %s, shutting down", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	case <-ctx.Done():
+		log.Print("shutting down")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		_ = srv.Shutdown(shutCtx)
 	}
 }
 

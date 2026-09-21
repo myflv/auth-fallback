@@ -1,9 +1,8 @@
 // auth-fallback puts a pool of Cline API keys behind one OpenAI-shaped
 // endpoint. A model keeps using one key until upstream answers 429, which parks
-// that key for that model and moves the request on to the next key.
+// that key for that model and moves the request to the next one.
 //
-// Only /v1/chat/completions is routed; the request body is forwarded byte for
-// byte and the response is streamed back untouched.
+// Only /v1/chat/completions is routed, and both directions are byte-transparent.
 package main
 
 import (
@@ -21,11 +20,13 @@ import (
 
 const (
 	clientType = "cline-cli"
-	// maxBody is plenty for a chat request, images and all, and stops a rogue
-	// caller from making the proxy hold gigabytes.
+	// maxBody stops a caller from making the proxy hold gigabytes.
 	maxBody = 64 << 20
 	// maxErrBody caps how much of an upstream error we keep to hand back.
 	maxErrBody = 64 << 10
+	// maxModelLen is far past any real model id. The name is a key in the
+	// pool's tables, so an implausible one is refused rather than carried.
+	maxModelLen = 256
 )
 
 var hopHeaders = []string{
@@ -48,16 +49,13 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
-	// Every other endpoint sits behind the token, so a new one cannot
-	// accidentally ship open.
+	// Every other path is behind the token, so a new one cannot ship open.
 	if !p.authorized(r) {
 		writeError(w, http.StatusUnauthorized, "wrong or missing proxy token")
 		return
 	}
 
 	switch r.URL.Path {
-	case "/status":
-		writeJSON(w, http.StatusOK, p.pool.snapshot(time.Now()))
 	case "/v1/chat/completions":
 		p.chat(w, r)
 	default:
@@ -77,6 +75,10 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := peekModel(body)
+	if len(model) > maxModelLen {
+		writeError(w, http.StatusBadRequest, "model name is implausibly long")
+		return
+	}
 
 	order := p.pool.order(model, time.Now())
 	tries := min(len(order), p.maxAttempts)
@@ -85,15 +87,16 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Retries are deliberately narrow: only a 429 moves on to the next key. It
-	// arrives immediately, so a retry never multiplies the caller's latency,
-	// and it is the one answer that says something about the key rather than
-	// about the request.
+	// Only a 429 moves on to the next key: it arrives immediately, and it is
+	// the one answer that says something about the key rather than the request.
 	for n, index := range order[:tries] {
 		if r.Context().Err() != nil {
 			return // caller hung up; nothing left to answer
 		}
 
+		// When the request goes out decides what its reply is allowed to say
+		// about the key -- see pool.succeeded.
+		sent := time.Now()
 		resp, err := p.send(r, body, index)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
@@ -101,22 +104,23 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if resp.StatusCode == http.StatusOK {
-			p.pool.succeeded(index, model)
-			p.logf("model=%s key=%d ok", model, index)
+			p.pool.succeeded(index, model, sent)
+			// %q, because the model name comes from the request body and a
+			// newline in it would forge a log line.
+			p.logf("model=%q key=%d ok", model, index)
 			p.relay(w, resp)
 			return
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests {
-			// A bad request, a rejected key, an upstream outage: the next key
-			// would answer the same way, so this goes straight back rather than
-			// costing the caller more round trips.
+			// The next key would answer the same way, so this goes straight
+			// back rather than costing the caller more round trips.
 			p.relay(w, resp)
 			return
 		}
 
 		until := p.pool.rateLimited(index, model, time.Now())
-		log.Printf("model=%s key=%d 429, parked for %s",
+		log.Printf("model=%q key=%d 429, parked for %s",
 			model, index, time.Until(until).Round(time.Second))
 
 		if n < tries-1 {
@@ -124,10 +128,9 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// That was the last key we were willing to try. Upstream's own 429 goes
-		// back, with our Retry-After on it. Synthesizing "every key is rate
-		// limited" here would be a lie whenever max_attempts cut the loop short
-		// and other keys were sitting free.
+		// Last key we were willing to try: upstream's own 429 goes back, with
+		// our Retry-After on it. Saying "every key is rate limited" would be a
+		// lie whenever max_attempts cut the loop short.
 		if secs := p.pool.retryAfter(model, time.Now()); secs > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
 		}
@@ -191,8 +194,7 @@ func (p *proxy) relay(w http.ResponseWriter, resp *http.Response) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(resp.StatusCode)
 
-	// http.ResponseWriter always implements Flusher in practice, but a flush
-	// per write is only free on the streaming path, so keep the plain copy as
+	// A ResponseWriter always implements Flusher in practice; the plain copy is
 	// the fallback.
 	var dst io.Writer = w
 	if f, ok := w.(http.Flusher); ok {
@@ -215,8 +217,7 @@ func (p *proxy) logf(format string, args ...any) {
 }
 
 // peekModel pulls the model out of the body, which is what cooldowns are scoped
-// by. A body we cannot parse gets the empty model, sharing one cooldown slot;
-// upstream will reject it anyway.
+// by. A body we cannot parse gets the empty model; upstream will reject it.
 func peekModel(body []byte) string {
 	var probe struct {
 		Model string `json:"model"`
